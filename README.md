@@ -47,9 +47,11 @@ Whisper.jl takes samples, not files. Any loader works; this resamples to 16 kHz 
 using FileIO, LibSndFile, SampledSignals
 
 s = load("speech.ogg")
-out = SampleBuf(Float32, 16000, round(Int, length(s) * (16000 / samplerate(s))), nchannels(s))
-write(SampleBufSink(out), SampleBufSource(s))                     # resample
-audio = nchannels(out) == 1 ? vec(out.data) : vec(sum(out.data, dims = 2)) ./ nchannels(out)
+n = round(Int, length(s) * (16000 / samplerate(s)))
+out = SampleBuf(zeros(Float32, n, nchannels(s)), 16000)          # zeroed: the resampler may write < n frames
+written = write(SampleBufSink(out), SampleBufSource(s))          # resample
+data = out.data[1:min(written, n), :]
+audio = nchannels(s) == 1 ? vec(data) : vec(sum(data, dims = 2)) ./ nchannels(s)
 ```
 
 For a 16 kHz mono WAV, `WAV.wavread` gives usable samples directly.

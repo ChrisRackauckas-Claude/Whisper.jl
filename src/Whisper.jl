@@ -83,11 +83,16 @@ collector, or explicitly with `close`.
 - `gpu_device`: which GPU to use when several are present.
 - `flash_attn`: use flash attention (GPU backends only).
 
+Each `transcribe` call runs on a fresh decoder state, so transcriptions of unrelated
+audio on the same context do not influence each other (whisper.cpp would otherwise
+keep the previous transcript as the decoder prompt). The model weights are shared.
+
 A context is not thread-safe: do not call `transcribe` on the same context from
 several threads at once.
 """
 mutable struct WhisperContext
     ptr::Ptr{whisper_context}
+    state::Ptr{whisper_state}      # decoder state of the most recent transcribe call
     model::String
 
     function WhisperContext(model::AbstractString;
@@ -97,15 +102,25 @@ mutable struct WhisperContext
         cparams = _with(whisper_context_default_params();
                         use_gpu = use_gpu, gpu_device = Cint(gpu_device),
                         flash_attn = flash_attn)
-        ptr = whisper_init_from_file_with_params(path, cparams)
+        # no_state: we create a state per transcribe call instead
+        ptr = whisper_init_from_file_with_params_no_state(path, cparams)
         ptr == C_NULL && error("whisper.cpp failed to load model \"$model\" from $path")
-        ctx = new(ptr, String(model))
+        ctx = new(ptr, C_NULL, String(model))
         finalizer(close, ctx)
         return ctx
     end
 end
 
+function _free_state!(ctx::WhisperContext)
+    if ctx.state != C_NULL
+        whisper_free_state(ctx.state)
+        ctx.state = C_NULL
+    end
+    return nothing
+end
+
 function Base.close(ctx::WhisperContext)
+    _free_state!(ctx)
     if ctx.ptr != C_NULL
         whisper_free(ctx.ptr)
         ctx.ptr = C_NULL
@@ -192,6 +207,13 @@ function transcribe(ctx::WhisperContext, audio::AbstractVector{<:Real};
         @warn "model \"$(ctx.model)\" is English-only; language=\"$lang\" will be ignored" maxlog = 1
     end
 
+    # Fresh decoder state for this call. whisper.cpp keeps the previous call's text in
+    # the state as the decoder prompt (state->prompt_past), which makes transcripts
+    # bleed into each other when a context is reused across unrelated audio. The
+    # state is kept until the next call so segments()/detected_language() can read it.
+    state = whisper_init_state(cptr)
+    state == C_NULL && error("whisper_init_state failed")
+
     # whisper_full_params has nested anonymous structs, so the binding exposes it
     # as opaque bytes with generated pointer accessors; fill it through a Ref.
     params = Ref(whisper_full_default_params(strategy))
@@ -215,14 +237,19 @@ function transcribe(ctx::WhisperContext, audio::AbstractVector{<:Real};
         p.print_realtime = false
         p.print_special = false
         p.print_timestamps = false
-        whisper_full(cptr, params[], samples, length(samples))
+        whisper_full_with_state(cptr, state, params[], samples, length(samples))
     end
-    ret == 0 || error("whisper_full failed with code $ret")
+    if ret != 0
+        whisper_free_state(state)
+        error("whisper_full failed with code $ret")
+    end
+    _free_state!(ctx)
+    ctx.state = state
 
-    n = whisper_full_n_segments(cptr)
+    n = whisper_full_n_segments_from_state(state)
     io = IOBuffer()
     for i in 0:(n - 1)
-        write(io, unsafe_string(whisper_full_get_segment_text(cptr, i)))
+        write(io, unsafe_string(whisper_full_get_segment_text_from_state(state, i)))
     end
     return String(take!(io))
 end
@@ -244,14 +271,18 @@ The segments produced by the most recent [`transcribe`](@ref) call on `ctx`, wit
 start and end times in seconds.
 """
 function segments(ctx::WhisperContext)
-    cptr = _check(ctx)
-    n = whisper_full_n_segments(cptr)
-    out = Vector{@NamedTuple{t0::Float64, t1::Float64, text::String}}(undef, n)
+    _check(ctx)
+    st = ctx.state
+    T = @NamedTuple{t0::Float64, t1::Float64, text::String}
+    st == C_NULL && return T[]
+    n = whisper_full_n_segments_from_state(st)
+    out = Vector{T}(undef, n)
     for i in 0:(n - 1)
         # whisper.cpp reports times in centiseconds
-        t0 = whisper_full_get_segment_t0(cptr, i) / 100
-        t1 = whisper_full_get_segment_t1(cptr, i) / 100
-        out[i + 1] = (t0 = t0, t1 = t1, text = unsafe_string(whisper_full_get_segment_text(cptr, i)))
+        t0 = whisper_full_get_segment_t0_from_state(st, i) / 100
+        t1 = whisper_full_get_segment_t1_from_state(st, i) / 100
+        out[i + 1] = (t0 = t0, t1 = t1,
+                      text = unsafe_string(whisper_full_get_segment_text_from_state(st, i)))
     end
     return out
 end
@@ -262,7 +293,10 @@ end
 ISO 639-1 code of the language whisper.cpp decided on during the most recent
 [`transcribe`](@ref) call (meaningful with `language = "auto"`).
 """
-detected_language(ctx::WhisperContext) =
-    unsafe_string(whisper_lang_str(whisper_full_lang_id(_check(ctx))))
+function detected_language(ctx::WhisperContext)
+    _check(ctx)
+    ctx.state == C_NULL && throw(ArgumentError("no transcription has been run on this context yet"))
+    return unsafe_string(whisper_lang_str(whisper_full_lang_id_from_state(ctx.state)))
+end
 
 end # module

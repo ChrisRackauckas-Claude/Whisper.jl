@@ -7,8 +7,29 @@ using FileIO
 using LibSndFile
 using SampledSignals
 using StringDistances
+using Downloads
 
 Whisper.log_level!(:error)
+
+# Wikimedia rate-limits clients without a descriptive User-Agent and answers 429; a
+# failed fetch must not leave a half-written file behind, so download with an
+# explicit User-Agent, retry with backoff, and write under a temporary name.
+function fetch_sample(remote, localdir)
+    mkpath(localdir)
+    local_path = joinpath(localdir, "sample-" * string(hash(remote); base = 16))
+    for attempt in 1:5
+        try
+            Downloads.download(remote, local_path;
+                headers = ["User-Agent" => "Whisper.jl-tests/0.2 (https://github.com/aviks/Whisper.jl)"])
+            return local_path
+        catch e
+            rm(local_path; force = true)
+            (e isa Downloads.RequestError && attempt < 5) || rethrow()
+            @warn "download of $(basename(remote)) failed (attempt $attempt), retrying" e.response.status
+            sleep(15.0 * attempt)
+        end
+    end
+end
 
 register(DataDep(
     "WhisperSamples",
@@ -27,28 +48,30 @@ register(DataDep(
         "37de21902b32aa2fc147ccbfdcc0566cc7061fffb2c0b10874f05147c0b9de0f",
         "43ee99686d75fd2976128450cec95a621a70a99b4dbd1c224fb9b35c6549daae",
     ],
+    fetch_method = fetch_sample,
     post_fetch_method = [
-        file->mv(file, "gb0.oga"),
-        file->mv(file, "gb1.ogg"),
-        file->mv(file, "hp0.ogg"),
-        file->mv(file, "mm1.wav"),
-        file->mv(file, "es1.ogg")
+        file -> mv(file, joinpath(dirname(file), "gb0.oga")),
+        file -> mv(file, joinpath(dirname(file), "gb1.ogg")),
+        file -> mv(file, joinpath(dirname(file), "hp0.ogg")),
+        file -> mv(file, joinpath(dirname(file), "mm1.wav")),
+        file -> mv(file, joinpath(dirname(file), "es1.ogg")),
     ]
 ))
 
 # Load an audio file and convert it to what Whisper expects: 16 kHz, mono, Float32.
 function load_audio(path)
     s = load(path)
-    sout = SampleBuf(Float32, 16000, round(Int, length(s) * (16000 / samplerate(s))), nchannels(s))
-    write(SampleBufSink(sout), SampleBufSource(s))
-    if nchannels(sout) == 1
-        return vec(sout.data)
-    else
-        return vec(sum(sout.data, dims = 2)) ./ nchannels(sout)
-    end
+    n = round(Int, length(s) * (16000 / samplerate(s)))
+    # SampleBuf(T, ...) allocates uninitialized memory and the resampler may write
+    # fewer than n frames; zero it and keep only what was written, or the tail of the
+    # buffer is whatever was in memory (e.g. a previously loaded clip).
+    sout = SampleBuf(zeros(Float32, n, nchannels(s)), 16000)
+    written = write(SampleBufSink(sout), SampleBufSource(s))
+    data = sout.data[1:min(written, n), :]
+    return nchannels(s) == 1 ? vec(data) : vec(sum(data, dims = 2)) ./ nchannels(s)
 end
 
-similarity(a, b) = compare(a, b, Levenshtein())
+text_similarity(a, b) = StringDistances.similarity(a, b, Levenshtein())
 clean(s) = strip(replace(s, "[BLANK_AUDIO]" => "", "[ Silence ]" => ""))
 
 # Bundled 11 s clip from whisper.cpp's samples (JFK, public domain). Lets most of the
@@ -101,13 +124,13 @@ end
     r1 = transcribe(ctx, jfk)
     r2 = transcribe(ctx, jfk)                       # context is reusable
     @test r1 == r2
-    @test similarity(clean(r1), JFK_TEXT) > 0.9
+    @test text_similarity(clean(r1), JFK_TEXT) > 0.9
 
     segs = segments(ctx)
     @test !isempty(segs)
     @test all(s -> s.t0 <= s.t1, segs)
     @test first(segs).t0 >= 0
-    @test similarity(clean(join(s.text for s in segs)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(join(s.text for s in segs)), JFK_TEXT) > 0.9
 
     @test transcribe(ctx, Float32[]) == ""
 
@@ -121,12 +144,12 @@ end
 
 @testset "transcribe options" begin
     ctx = WhisperContext("tiny.en"; use_gpu = false)
-    @test similarity(clean(transcribe(ctx, jfk; sampling = :beam, beam_size = 3)), JFK_TEXT) > 0.9
-    @test similarity(clean(transcribe(ctx, jfk; n_threads = 2)), JFK_TEXT) > 0.9
-    @test similarity(clean(transcribe(ctx, jfk; initial_prompt = "JFK inaugural address.")), JFK_TEXT) > 0.85
-    @test similarity(clean(transcribe(ctx, jfk; no_timestamps = true)), JFK_TEXT) > 0.9
-    @test similarity(clean(transcribe(ctx, jfk; single_segment = true)), JFK_TEXT) > 0.9
-    @test similarity(clean(transcribe(ctx, jfk; temperature = 0.2)), JFK_TEXT) > 0.8
+    @test text_similarity(clean(transcribe(ctx, jfk; sampling = :beam, beam_size = 3)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe(ctx, jfk; n_threads = 2)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe(ctx, jfk; initial_prompt = "JFK inaugural address.")), JFK_TEXT) > 0.85
+    @test text_similarity(clean(transcribe(ctx, jfk; no_timestamps = true)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe(ctx, jfk; single_segment = true)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe(ctx, jfk; temperature = 0.2)), JFK_TEXT) > 0.8
     # first ~3 s only
     short = transcribe(ctx, jfk; duration_ms = 3000)
     @test length(short) < length(JFK_TEXT)
@@ -138,8 +161,8 @@ end
 
 @testset "one-shot transcribe and GPU flag" begin
     # use_gpu=true must be harmless on a CPU-only build (falls back)
-    @test similarity(clean(transcribe("tiny.en", jfk; use_gpu = true)), JFK_TEXT) > 0.9
-    @test similarity(clean(transcribe("tiny.en", jfk; use_gpu = false)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe("tiny.en", jfk; use_gpu = true)), JFK_TEXT) > 0.9
+    @test text_similarity(clean(transcribe("tiny.en", jfk; use_gpu = false)), JFK_TEXT) > 0.9
     @test_throws ArgumentError transcribe("no-such-model", jfk)
 end
 
@@ -153,7 +176,7 @@ end
     ctx = WhisperContext("base")
     @test Whisper.is_multilingual(ctx)
     r = transcribe(ctx, jfk; language = "auto")
-    @test similarity(clean(r), JFK_TEXT) > 0.9
+    @test text_similarity(clean(r), JFK_TEXT) > 0.9
     @test Whisper.detected_language(ctx) == "en"
     es = load_audio(DataDeps.resolve("WhisperSamples/es1.ogg", "__FILE__"))
     transcribe(ctx, es; language = "auto", duration_ms = 20_000)
@@ -165,7 +188,7 @@ function transcribe_test(ctx, audio_file, txt_file; accuracy = 0.99)
     audio = load_audio(DataDeps.resolve("WhisperSamples/$audio_file", "__FILE__"))
     result = clean(transcribe(ctx, audio))
     expected = readlines(joinpath(@__DIR__, txt_file))[1]
-    sim = similarity(expected, result)
+    sim = text_similarity(expected, result)
     sim > accuracy || @info "similarity $sim below $accuracy" audio_file result
     @test sim > accuracy
 end
