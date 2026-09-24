@@ -145,6 +145,38 @@ Whether the loaded model supports languages other than English.
 """
 is_multilingual(ctx::WhisperContext) = whisper_is_multilingual(_check(ctx)) != 0
 
+# whisper.cpp splits text into words with a std::regex, whose bracket expressions run
+# bytes through std::collate::transform, i.e. the C runtime's strxfrm under the
+# current LC_COLLATE. Julia sets the user's locale at startup, and on Windows msvcrt's
+# strxfrm fails for some bytes under e.g. "English_United States.1252". The
+# libstdc++ shipped with Julia >= 1.13 (GCC 15) throws a C++ exception on that
+# failure, which unwinds into Julia and kills the process. Collation is irrelevant
+# to the tokenizer's regex, so run it under the "C" collation.
+const _MSVCRT_LC_COLLATE = Cint(1)
+
+function _with_c_collation(f)
+    Sys.iswindows() || return f()
+    cur = ccall((:setlocale, "msvcrt"), Cstring, (Cint, Ptr{Cchar}), _MSVCRT_LC_COLLATE, C_NULL)
+    old = cur == C_NULL ? "C" : unsafe_string(cur)
+    old == "C" && return f()
+    ccall((:setlocale, "msvcrt"), Cstring, (Cint, Cstring), _MSVCRT_LC_COLLATE, "C")
+    try
+        return f()
+    finally
+        ccall((:setlocale, "msvcrt"), Cstring, (Cint, Cstring), _MSVCRT_LC_COLLATE, old)
+    end
+end
+
+function _tokenize(ctx::WhisperContext, text::AbstractString)
+    cptr = _check(ctx)
+    s = String(text)
+    # every token covers at least one byte of the input
+    tokens = Vector{whisper_token}(undef, ncodeunits(s) + 1)
+    n = _with_c_collation(() -> whisper_tokenize(cptr, s, tokens, length(tokens)))
+    n < 0 && error("whisper_tokenize needed $(-n) tokens for a $(ncodeunits(s))-byte prompt")
+    return resize!(tokens, n)
+end
+
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
@@ -202,7 +234,7 @@ function transcribe(ctx::WhisperContext, audio::AbstractVector{<:Real};
 
     # Strings pointed to from the params must outlive whisper_full.
     lang = language === nothing ? nothing : String(language)
-    prompt = initial_prompt === nothing ? nothing : String(initial_prompt)
+    prompt_tokens = initial_prompt === nothing ? whisper_token[] : _tokenize(ctx, initial_prompt)
     if lang !== nothing && lang != "en" && lang != "auto" && !is_multilingual(ctx)
         @warn "model \"$(ctx.model)\" is English-only; language=\"$lang\" will be ignored" maxlog = 1
     end
@@ -217,7 +249,7 @@ function transcribe(ctx::WhisperContext, audio::AbstractVector{<:Real};
     # whisper_full_params has nested anonymous structs, so the binding exposes it
     # as opaque bytes with generated pointer accessors; fill it through a Ref.
     params = Ref(whisper_full_default_params(strategy))
-    ret = GC.@preserve params samples lang prompt begin
+    ret = GC.@preserve params samples lang prompt_tokens begin
         p = Base.unsafe_convert(Ptr{whisper_full_params}, params)
         p.n_threads = Cint(n_threads)
         p.translate = translate
@@ -231,7 +263,9 @@ function transcribe(ctx::WhisperContext, audio::AbstractVector{<:Real};
         p.temperature = Cfloat(temperature)
         p.greedy.best_of = Cint(best_of)
         p.beam_search.beam_size = Cint(beam_size)
-        p.initial_prompt = prompt === nothing ? Ptr{Cchar}(C_NULL) : Ptr{Cchar}(pointer(prompt))
+        # Passed pre-tokenized rather than as initial_prompt; see _tokenize.
+        p.prompt_tokens = isempty(prompt_tokens) ? Ptr{whisper_token}(C_NULL) : pointer(prompt_tokens)
+        p.prompt_n_tokens = Cint(length(prompt_tokens))
         # whisper.cpp prints progress and live results by default; keep quiet.
         p.print_progress = false
         p.print_realtime = false

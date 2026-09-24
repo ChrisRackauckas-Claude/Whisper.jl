@@ -147,6 +147,15 @@ end
     @test text_similarity(clean(transcribe(ctx, jfk; sampling = :beam, beam_size = 3)), JFK_TEXT) > 0.9
     @test text_similarity(clean(transcribe(ctx, jfk; n_threads = 2)), JFK_TEXT) > 0.9
     @test text_similarity(clean(transcribe(ctx, jfk; initial_prompt = "JFK inaugural address.")), JFK_TEXT) > 0.85
+    toks = Whisper._tokenize(ctx, "JFK inaugural address.")
+    @test 0 < length(toks) <= ncodeunits("JFK inaugural address.")
+    @test isempty(Whisper._tokenize(ctx, ""))
+    if Sys.iswindows()
+        collation() = unsafe_string(ccall((:setlocale, "msvcrt"), Cstring, (Cint, Ptr{Cchar}), 1, C_NULL))
+        before = collation()
+        Whisper._with_c_collation(() -> @test collation() == "C")
+        @test collation() == before
+    end
     @test text_similarity(clean(transcribe(ctx, jfk; no_timestamps = true)), JFK_TEXT) > 0.9
     @test text_similarity(clean(transcribe(ctx, jfk; single_segment = true)), JFK_TEXT) > 0.9
     @test text_similarity(clean(transcribe(ctx, jfk; temperature = 0.2)), JFK_TEXT) > 0.8
