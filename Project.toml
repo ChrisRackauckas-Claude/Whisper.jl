@@ -1,7 +1,7 @@
 name = "Whisper"
 uuid = "1846abd0-4e01-46c4-9113-916b63b070ed"
 authors = ["Avik Sengupta <avik@sengupta.net> and contributors"]
-version = "0.2.0"
+version = "1.0.0"
 
 [deps]
 CEnum = "fa961155-64e5-5f13-b03f-caf6b980ea82"
